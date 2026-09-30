@@ -49,8 +49,8 @@
               (sut/with-scope {:shutdown :on-failure}
                 (reset! slow-ref (tc/fiber (Thread/sleep 30000)))
                 (tc/fiber (throw (ex-info "boom" {}))))))
-        ;; The sibling's result is cancelled on Jolt (body not forcibly stopped).
-        (is (tc/errored? @slow-ref)))
+        (is (tc/errored? @slow-ref))
+        (is (not (tc/alive? @slow-ref)) "scope exit waits for the interrupted sibling"))
       (finally
         (tc/set-stream-error-handler! println))))
 

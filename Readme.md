@@ -12,12 +12,10 @@ body runs on its own thread. Results, errors, timeouts, and cancellation all
 flow through that handle. The concurrency substrate is
 `clojure.core.async`.
 
-On Jolt there is no JVM thread interruption, so `interrupt!`/`timeout!` deliver
-a cancellation to the fiber's result (a `deref` then sees it) but cannot
-forcibly stop a body blocked on `Thread/sleep`. Cooperative bodies — those that
-park on channel operations or check a cancellation flag — stop promptly; a body
-pinned in a blocking call runs to completion in the background while its result
-is reported as cancelled.
+Each fiber runs on its own daemon thread. `interrupt!` and `timeout!` settle the
+fiber's result and interrupt that thread, so a body blocked in `Thread/sleep`,
+a deref, a `join`, or another interruptible wait throws `InterruptedException`
+and stops.
 
 Cancellation surfaces as `clojure.lang.ExceptionInfo` carrying `{:type
 :tapestry.core/interrupted}` or `{:type :tapestry.core/timeout}`.
@@ -29,8 +27,8 @@ manifold/`java.util.concurrent` substrate with `core.async`.
 
 ## Installation
 
-Requires the [jolt](https://jolt-lang.github.io/) binary. Add to your
-deps.edn:
+Requires the [jolt](https://jolt-lang.github.io/) binary, version 0.8.15 or
+later. Add to your deps.edn:
 
 ```
 jolt-lang/tapestry {:git/url "https://github.com/jolt-lang/tapestry"
@@ -74,10 +72,10 @@ jolt-lang/tapestry {:git/url "https://github.com/jolt-lang/tapestry"
 
 (let [f (fiber (Thread/sleep 10000))]
   (alive? f) ;; true
-  (interrupt! f)
-  (alive? f) ;; true until the body's thread finishes, but
+  (interrupt! f) ;; the sleep throws InterruptedException
   (errored? f) ;; true — the fiber's result was cancelled
   @f ;; throws ExceptionInfo {:type :tapestry.core/interrupted}
+  (alive? f) ;; false once the body has unwound
   )
 ```
 
@@ -162,8 +160,13 @@ each fiber will have a timeout that starts from when the fiber was spawned.
 #### Streams (channels)
 
 `asyncly` and `parallelly` also accept `core.async` channels, allowing you to
-describe parallel execution pipelines. `periodically` returns a channel that
-emits `(f)` every `period`; close it to stop.
+describe parallel execution pipelines. Over a channel they return a channel;
+`parallelly` emits results in input order as they finish, `asyncly` in
+completion order. A channel can't carry an exception, so in stream mode the
+first error goes to the stream error handler (see `set-stream-error-handler!`),
+the in-flight calls are interrupted, and the result channel closes. Over a seq,
+the error is thrown instead. `periodically` returns a channel that emits `(f)`
+every `period`; close it to stop.
 
 ```clojure
 (require '[clojure.core.async :as a]
@@ -303,10 +306,14 @@ capacity for a bounded queue or `:unbounded`.
 
 ## Advisories
 
-- `interrupt!` and `timeout!` are cooperative on Jolt: a body blocked in a
-  non-cooperative call (e.g. `Thread/sleep`) keeps running in the background
-  while its result reports cancelled. Park on channel operations or check
-  `errored?` in loops for prompt cancellation.
+- Interruption stops a body only at an interruptible wait. A body spinning on
+  the CPU, or blocked where the JVM wouldn't interrupt either (entering a
+  `locking` monitor), runs until it reaches one, and its result is reported as
+  cancelled in the meantime. A scope waits for such bodies on exit, so check
+  `(Thread/interrupted)` in long loops.
+- `clojure.core.async` blocking ops (`<!!`, `>!!`, `alts!!`) ignore thread
+  interrupts on jolt 0.8.15 and earlier; a fiber parked in one is not stopped
+  by `interrupt!`/`timeout!` until the operation completes.
 - `with-max-parallelism` and `with-scope :max-parallelism` require a positive
   integer; other values throw at scope entry.
 

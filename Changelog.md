@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.6.0
+
+Catches up with jolt 0.8.15, which can interrupt threads: cancelling a fiber
+now stops its body again, as it did on the JVM.
+
+### Breaking Changes
+
+- Requires jolt 0.8.15 or later.
+- `parallelly` over a channel streams results in order instead of reading the
+  whole source first. A failure goes to the stream error handler and closes the
+  result channel instead of being thrown from the `parallelly` call; nil
+  results are dropped. Seq mode is unchanged.
+- Scope exit waits for fiber threads to finish, not just for their results to
+  settle.
+
+### Fixes
+
+- `fiber` and `with-max-parallelism` failed to compile outside
+  `tapestry.core`: their expansions called private functions, which jolt now
+  rejects as JVM Clojure does.
+- `interrupt!` and `timeout!` (including `timeout!` with a default) interrupt
+  the fiber's thread. Previously the body ran to completion in the background.
+- A fiber cancelled while waiting for a `with-max-parallelism` permit no longer
+  runs its body once a permit frees up.
+- A `timeout!` no longer holds a thread for the full timeout after its fiber
+  completes.
+- A fiber reports to the scope it was spawned in, even when it is cancelled
+  from outside that scope; before, the cancel was lost or credited to whatever
+  scope the caller was in.
+- When a scope body threw while fibers were running, the scope rethrew the
+  interrupt from its own shutdown instead of the body's error.
+- Scope exit also waits for fibers spawned by the scope's fibers.
+- `asyncly` interrupts in-flight calls on the first error, and its stream
+  mode closes the result right away instead of after the slowest call.
+  Unbounded `asyncly` honors `with-max-parallelism` and no longer retains a
+  handle per item.
+- `parallelly` interrupts the remaining calls on error.
+- `seq->stream` reports errors from realizing its seq to the stream error
+  handler instead of swallowing them.
+
 ## 0.5.1
 
 Fixes a settlement race where `alts` could return `nil` instead of throwing.

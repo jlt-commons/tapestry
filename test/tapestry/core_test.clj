@@ -166,10 +166,8 @@
         (sut/set-stream-error-handler! println))))
 
   (testing "bounded - error propagates despite blocked workers"
-    ;; On Jolt, Thread/sleep cannot be forcibly interrupted, so blocked workers
-    ;; run to completion in the background while the error is reported promptly
-    ;; (the result stream closes on error). The call must throw well before the
-    ;; 30s sleeps would finish.
+    ;; The blocked workers are interrupted, so the call throws well before
+    ;; the 30s sleeps would finish.
     (sut/set-stream-error-handler! (fn [& _]))
     (try
       (let [result* (promise)]
