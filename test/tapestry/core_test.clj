@@ -580,3 +580,30 @@
           (Thread/sleep 100)
           (is ((if n #{1 2} #{2}) @interrupted)))
         (finally (sut/set-stream-error-handler! println))))))
+
+(def channel-ops-interruptible?
+  "Whether this jolt interrupts a thread blocked in core.async `<!!`
+  (jolt 0.8.15 and earlier don't)."
+  (delay
+    (let [t (promise) r (promise) c (a/chan)]
+      (.start (Thread. (fn []
+                         (deliver t (Thread/currentThread))
+                         (try (a/<!! c) (deliver r false)
+                              (catch InterruptedException _ (deliver r true))))))
+      (.interrupt ^Thread @t)
+      (let [v (deref r 1000 false)]
+        (a/close! c)
+        v))))
+
+(deftest interrupt-channel-wait-test
+  (if-not @channel-ops-interruptible?
+    (println "skipping interrupt-channel-wait-test: this jolt can't interrupt <!!")
+    (do
+      (testing "interrupt! stops a fiber parked in <!!"
+        (let [f (sut/fiber (a/<!! (a/chan)))]
+          (Thread/sleep 20)
+          (sut/interrupt! f)
+          (is (await-dead f 2000))))
+      (testing "timeout! stops a fiber parked in >!!"
+        (let [f (sut/timeout! (sut/fiber (a/>!! (a/chan) :x)) 20)]
+          (is (await-dead f 2000)))))))

@@ -1,6 +1,6 @@
 (ns tapestry.queue-test
   (:require [tapestry.queue :as sut]
-            [tapestry.core :refer [fiber alive?]]
+            [tapestry.core :as tc :refer [fiber alive?]]
             [clojure.test :refer [deftest testing is]]))
 
 (deftest queue--sync-queue-test
@@ -126,3 +126,17 @@
             (throw (ex-info "Property violation"
                             {:put pv :take tv :items remaining}))))))
     (is true)))
+
+(deftest queue--interrupt-blocked-take-test
+  (if-not (force @(requiring-resolve 'tapestry.core-test/channel-ops-interruptible?))
+    (println "skipping queue--interrupt-blocked-take-test: this jolt can't interrupt <!!")
+    (let [q (sut/queue)
+          f (tc/fiber (sut/take! q))]
+      (Thread/sleep 20)
+      (tc/interrupt! f)
+      (Thread/sleep 50)
+      (is (not (tc/alive? f)))
+      (testing "the interrupted take didn't claim a later item"
+        (let [taker (tc/fiber (sut/take! q))]
+          (is (true? (sut/put! q :item)))
+          (is (= :item (deref taker 1000 ::timeout))))))))

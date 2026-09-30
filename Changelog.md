@@ -13,7 +13,9 @@ now stops its body again, as it did on the JVM.
   result channel instead of being thrown from the `parallelly` call; nil
   results are dropped. Seq mode is unchanged.
 - Scope exit waits for fiber threads to finish, not just for their results to
-  settle.
+  settle. On jolt 0.8.15, whose core.async blocking ops ignore interrupts, a
+  fiber parked in `<!!`/`>!!`/`alts!!` holds up scope exit until the op
+  completes.
 
 ### Fixes
 

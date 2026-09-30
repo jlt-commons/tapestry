@@ -217,46 +217,58 @@
 (defn ^:no-doc run-fiber!
   "Body of a fiber's thread: wait for a permit if `sem` is set, run `f`, and
   settle `fiber` with the outcome. A fiber cancelled before it starts, or
-  while queued for a permit, never runs `f`."
-  [^Fiber fiber sem f]
-  (let [permit? (try
-                  (and (not @(.settled* fiber))
-                       (or (nil? sem) (acquire-permit fiber sem)))
-                  (catch Throwable _ false))]
-    (if-not permit?
-      (do (reset! (.alive* fiber) false)
-          (settle! fiber [:err (interrupted-ex)]))
-      (let [outcome (try
-                      [:ok (f)]
-                      (catch Throwable e
-                        (swap! (.err* fiber) (fn [old] (or old e)))
-                        [:err e])
-                      (finally
-                        ;; put! never blocks, so an interrupt flag left set by
-                        ;; the body can't abort returning the permit.
-                        (when sem (a/put! sem :permit))
-                        (reset! (.alive* fiber) false)))]
-        (settle! fiber outcome)))))
+  while queued for a permit, never runs `f`. Calls `on-exit`, if given, last
+  and in every case."
+  [^Fiber fiber sem f on-exit]
+  (try
+    (let [permit? (try
+                    (and (not @(.settled* fiber))
+                         (or (nil? sem) (acquire-permit fiber sem)))
+                    (catch Throwable _ false))]
+      (cond
+        (not permit?)
+        (do (reset! (.alive* fiber) false)
+            (settle! fiber [:err (interrupted-ex)]))
+
+        ;; cancelled while the permit was being handed over
+        @(.settled* fiber)
+        (do (when sem (a/put! sem :permit))
+            (reset! (.alive* fiber) false))
+
+        :else
+        (let [outcome (try
+                        [:ok (f)]
+                        (catch Throwable e
+                          (swap! (.err* fiber) (fn [old] (or old e)))
+                          [:err e])
+                        (finally
+                          ;; put! never blocks, so an interrupt flag left set
+                          ;; by the body can't abort returning the permit.
+                          (when sem (a/put! sem :permit))
+                          (reset! (.alive* fiber) false)))]
+          (settle! fiber outcome))))
+    (finally
+      (when on-exit (on-exit)))))
 
 (defn ^:no-doc spawn-fiber!
   "Start `f` on a new daemon thread and return its `Fiber`. The fiber is
-  registered with the current scope, has any `with-timeout` applied, and is
-  passed to `before-start` (if given) before its thread starts."
+  registered with the current scope and has any `with-timeout` applied before
+  its thread starts. `on-exit`, if given, is called on the fiber's thread
+  when it is done, whether or not `f` ran."
   ([f] (spawn-fiber! f nil))
-  ([f before-start]
+  ([f on-exit]
    (let [sem    *local-semaphore*
          ;; Not a promise: a fiber cancelled before its thread starts has the
          ;; interrupt flag set, and a promise deref would throw on it.
          ;; `.start` publishes the write to the new thread.
          holder (volatile! nil)
-         thread (Thread. ^Runnable (bound-fn* (fn [] (run-fiber! @holder sem f))))
+         thread (Thread. ^Runnable (bound-fn* (fn [] (run-fiber! @holder sem f on-exit))))
          fiber  (Fiber. (promise) (atom true) (atom nil) (atom false)
                         (a/chan) *scope-notify!* thread)]
      (vreset! holder fiber)
      (.setDaemon thread true)
      (when *scope-register!* (*scope-register!* fiber))
      (when *local-timeout* (timeout! fiber *local-timeout*))
-     (when before-start (before-start fiber))
      (.start thread)
      fiber)))
 
@@ -342,14 +354,34 @@
          (finally (a/close! out))))
      out)))
 
-(defn- interrupt-thread!
-  "Interrupt the thread running `fiber` without settling it, unless that is
-  the calling thread. Used by asyncly/parallelly, whose fibers catch their
-  own errors so an internal cancel isn't recorded by an enclosing scope."
-  [^Fiber fiber]
-  (let [^Thread t (.thread fiber)]
-    (when-not (identical? t (Thread/currentThread))
-      (.interrupt t))))
+;; A work group lets asyncly/parallelly stop their calls on the first error.
+;; Calls register their thread only once their body starts, so a fiber still
+;; queued for a permit is never interrupted: it would settle as cancelled,
+;; which an enclosing :on-failure scope would take for the real error.
+;; Instead it sees the group stopped when it starts and skips its body.
+
+(defn- work-group []
+  {:stopped (atom false) :running (atom #{})})
+
+(defn- run-in-group
+  "Run `(f)` on the calling thread as part of `group`, unless the group has
+  stopped, in which case return `stopped`."
+  [{:keys [stopped running]} f stopped-val]
+  (let [t (Thread/currentThread)]
+    (swap! running conj t)
+    (try
+      (if @stopped stopped-val (f))
+      (finally (swap! running disj t)))))
+
+(defn- stop-group!
+  "Stop `group` and interrupt its running calls, other than the caller's.
+  Returns true for the caller that stopped it."
+  [{:keys [stopped running]}]
+  (when (compare-and-set! stopped false true)
+    (doseq [^Thread t @running]
+      (when-not (identical? t (Thread/currentThread))
+        (.interrupt t)))
+    true))
 
 ;; ---------------------------------------------------------------------------
 ;; asyncly — concurrent, order-independent map
@@ -359,50 +391,44 @@
   "Map `f` over channel `src` onto channel `result` on fibers: `n` workers
   pulling from `src`, or a fiber per item when `n` is nil. On the first error,
   reports it to `on-error`, closes `src` and `result`, and interrupts the
-  in-flight calls. Otherwise `result` closes once every fiber has settled.
+  in-flight calls. Otherwise `result` closes once every fiber has exited.
   Returns an atom holding the first error, if any."
   [n f src result]
-  (let [err     (atom nil)
-        ;; Thread -> Fiber for fibers whose work hasn't finished. Fibers are
-        ;; added before their thread starts and remove themselves when done.
-        running (atom {})
-        fail!   (fn [e]
-                  (when (compare-and-set! err nil e)
-                    (when on-error (on-error e "Exception in asyncly function"))
-                    (a/close! src)
-                    (a/close! result)
-                    (run! interrupt-thread! (vals @running))))
-        ;; Errors after the first, including the interrupts fail! causes,
-        ;; are dropped, so the fibers themselves always settle cleanly.
-        guard   (fn [body]
-                  (fn []
-                    (try (body)
-                         (catch Throwable e (when-not @err (fail! e)))
-                         (finally (swap! running dissoc (Thread/currentThread))))
-                    nil))
-        call!   (fn [item]
-                  (when-not @err
-                    (when-some [v (f item)] (a/>!! result v))))
-        spawn!  (fn [body]
-                  (spawn-fiber! (guard body)
-                                (fn [^Fiber fb] (swap! running assoc (.thread fb) fb))))
-        settle-all! (fn [fibers]
-                      (run! (fn [^Fiber fb] (a/<!! (.done fb))) fibers)
-                      (a/close! result))]
+  (let [err    (atom nil)
+        group  (work-group)
+        ;; the dispatcher plus every fiber that hasn't exited
+        live   (atom 1)
+        exit!  #(when (zero? (swap! live dec)) (a/close! result))
+        fail!  (fn [e]
+                 (when (compare-and-set! err nil e)
+                   (when on-error (on-error e "Exception in asyncly function"))
+                   (a/close! src)
+                   (a/close! result)
+                   (stop-group! group)))
+        call!  (fn [item]
+                 (when-some [v (f item)] (a/>!! result v)))
+        ;; Errors after the first, including the interrupts fail! causes, are
+        ;; dropped, so the fibers themselves always settle cleanly.
+        spawn! (fn [body]
+                 (swap! live inc)
+                 (spawn-fiber! #(try (run-in-group group body nil)
+                                     (catch Throwable e (when-not @err (fail! e))))
+                               exit!))]
     (if n
-      (let [worker #(loop []
-                      (when-some [item (a/<!! src)]
-                        (call! item)
-                        (recur)))
-            fibers (doall (repeatedly (max 1 n) #(spawn! worker)))]
-        (a/thread (settle-all! fibers)))
+      (do (dotimes [_ (max 1 n)]
+            (spawn! #(loop []
+                       (when-some [item (a/<!! src)]
+                         (when-not @err
+                           (call! item)
+                           (recur))))))
+          (exit!))
       (a/thread
         (loop []
           (when-some [item (a/<!! src)]
             (when-not @err
               (spawn! #(call! item))
               (recur))))
-        (settle-all! (vals @running))))
+        (exit!)))
     err))
 
 (defn- asyncly-seq [n f s]
@@ -430,10 +456,12 @@
    (if (seqable? s) (asyncly-seq n f s) (asyncly-stream n f s))))
 
 (defn- guarded
-  "A thunk calling `(f x)` that returns `[:ok v]` or `[:err e]` rather than
-  throwing."
-  [f x]
-  (fn [] (try [:ok (f x)] (catch Throwable e [:err e]))))
+  "A thunk calling `(f x)` as part of `group` that returns `[:ok v]` or
+  `[:err e]` rather than throwing (nil if the group stopped first)."
+  [group f x]
+  (fn []
+    (try (run-in-group group (fn [] [:ok (f x)]) nil)
+         (catch Throwable e [:err e]))))
 
 (defn- outcome
   "The tagged outcome of a `guarded` fiber, or `[:err e]` if the fiber itself
@@ -442,43 +470,37 @@
   (try @fiber (catch Throwable e [:err e])))
 
 (defn- parallelly-seq [n f s]
-  (let [spawn  #(spawn-fiber! (guarded f %))
+  (let [group  (work-group)
+        spawn  #(spawn-fiber! (guarded group f %))
         fibers (if n
                  (binding [*local-semaphore* (make-semaphore (max 1 n))]
                    (mapv spawn s))
                  (mapv spawn s))]
-    (loop [acc (transient []) i 0]
-      (if (= i (count fibers))
-        (persistent! acc)
-        (let [[tag v] (outcome (nth fibers i))]
-          (if (= :ok tag)
-            (recur (conj! acc v) (inc i))
-            (do (run! interrupt-thread! (subvec fibers (inc i)))
-                (throw v))))))))
+    (reduce (fn [acc fiber]
+              (let [[tag v] (outcome fiber)]
+                (if (= :ok tag)
+                  (conj acc v)
+                  (do (stop-group! group)
+                      (throw v)))))
+            [] fibers)))
 
 (defn- parallelly-stream [n f src]
   (let [out     (a/chan)
         ;; Fibers in input order. Bounds read-ahead to `n` for bounded calls.
         pending (a/chan (if n (max 1 n) Integer/MAX_VALUE))
-        stopped (atom false)
+        group   (work-group)
         stop!   (fn [e]
-                  (when (compare-and-set! stopped false true)
+                  (when (stop-group! group)
                     (when (and e on-error) (on-error e "Exception in parallelly function"))
                     (a/close! src)
                     (a/close! out)
-                    (a/close! pending)
-                    (loop []
-                      (when-some [fiber (a/poll! pending)]
-                        (interrupt-thread! fiber)
-                        (recur)))))]
+                    (a/close! pending)))]
     (binding [*local-semaphore* (if n (make-semaphore (max 1 n)) *local-semaphore*)]
       (a/thread
         (loop []
           (when-some [item (a/<!! src)]
-            (let [fiber (spawn-fiber! (guarded f item))]
-              (if (a/>!! pending fiber)
-                (recur)
-                (interrupt-thread! fiber)))))
+            (when (a/>!! pending (spawn-fiber! (guarded group f item)))
+              (recur))))
         (a/close! pending)))
     (a/thread
       (loop []

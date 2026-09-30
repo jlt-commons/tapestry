@@ -1,6 +1,7 @@
 (ns tapestry.experimental.scope-test
   (:require [tapestry.experimental.scope :as sut]
             [tapestry.core :as tc]
+            [clojure.core.async :as a]
             [clojure.test :refer [deftest testing is]]))
 
 (deftest with-scope-basic-test
@@ -298,3 +299,28 @@
             (tc/fiber (Thread/sleep 30000))
             (Thread/sleep 20)
             (throw (ex-info "body-error" {})))))))
+
+(deftest scope-exit-with-channel-wait-test
+  (if-not (force @(requiring-resolve 'tapestry.core-test/channel-ops-interruptible?))
+    (println "skipping scope-exit-with-channel-wait-test: this jolt can't interrupt <!!")
+    (testing "an :on-success scope exits when a sibling is parked on a channel"
+      (let [result (future (sut/with-scope {:shutdown :on-success}
+                             (tc/fiber (a/<!! (a/chan)))
+                             (tc/fiber :fast)
+                             :done))]
+        (is (= :done (deref result 3000 ::hung)))))))
+
+(deftest asyncly-queued-workers-inside-scope-test
+  (testing "with fibers queued for permits, the real asyncly error still surfaces"
+    (tc/set-stream-error-handler! (fn [& _]))
+    (try
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"real-error"
+            (sut/with-scope {:shutdown :on-failure}
+              (tc/with-max-parallelism 1
+                (doall (tc/asyncly (fn [x]
+                                     (when (= x 0)
+                                       (Thread/sleep 20)
+                                       (throw (ex-info "real-error" {}))))
+                                   (range 5)))))))
+      (finally (tc/set-stream-error-handler! println)))))
