@@ -469,20 +469,49 @@
   [fiber]
   (try @fiber (catch Throwable e [:err e])))
 
+(defn- spawn-in-order!
+  "Start a `guarded` fiber per item, in input order, putting each fiber onto
+  `pending`; `take-item` returns the next item or `::done`. With `n`, at most
+  `n` run at once, and the permit for an item is taken here, before its fiber
+  starts. If the fibers raced for permits themselves, a later item could run
+  ahead of the earlier one the caller is waiting on, and with every permit held
+  by later items the call stalls. The permit goes back when the fiber exits,
+  whether or not its body ran. Stops when the group stops or `pending` closes,
+  then closes `pending`."
+  [n f take-item pending group]
+  (let [sem (when n (make-semaphore (max 1 n)))]
+    (a/thread
+      ;; bounded calls take their own permits, so the fibers mustn't also wait
+      ;; on an enclosing with-max-parallelism
+      (binding [*local-semaphore* (if sem nil *local-semaphore*)]
+        (loop []
+          (let [item (take-item)]
+            (when-not (or (identical? ::done item) @(:stopped group))
+              (when sem (a/<!! sem))
+              (let [fiber (spawn-fiber! (guarded group f item)
+                                        (when sem #(a/put! sem :permit)))]
+                (when (a/>!! pending fiber)
+                  (recur)))))))
+      (a/close! pending))))
+
 (defn- parallelly-seq [n f s]
-  (let [group  (work-group)
-        spawn  #(spawn-fiber! (guarded group f %))
-        fibers (if n
-                 (binding [*local-semaphore* (make-semaphore (max 1 n))]
-                   (mapv spawn s))
-                 (mapv spawn s))]
-    (reduce (fn [acc fiber]
-              (let [[tag v] (outcome fiber)]
-                (if (= :ok tag)
-                  (conj acc v)
-                  (do (stop-group! group)
-                      (throw v)))))
-            [] fibers)))
+  (let [group   (work-group)
+        items   (atom (seq s))
+        ;; only the spawner thread takes items
+        take    #(if-let [[x & more] @items]
+                   (do (reset! items more) x)
+                   ::done)
+        pending (a/chan (if n (max 1 n) Integer/MAX_VALUE))]
+    (spawn-in-order! n f take pending group)
+    (loop [acc (transient [])]
+      (if-some [fiber (a/<!! pending)]
+        (let [[tag v] (outcome fiber)]
+          (if (= :ok tag)
+            (recur (conj! acc v))
+            (do (stop-group! group)
+                (a/close! pending)
+                (throw v))))
+        (persistent! acc)))))
 
 (defn- parallelly-stream [n f src]
   (let [out     (a/chan)
@@ -495,13 +524,7 @@
                     (a/close! src)
                     (a/close! out)
                     (a/close! pending)))]
-    (binding [*local-semaphore* (if n (make-semaphore (max 1 n)) *local-semaphore*)]
-      (a/thread
-        (loop []
-          (when-some [item (a/<!! src)]
-            (when (a/>!! pending (spawn-fiber! (guarded group f item)))
-              (recur))))
-        (a/close! pending)))
+    (spawn-in-order! n f #(let [v (a/<!! src)] (if (nil? v) ::done v)) pending group)
     (a/thread
       (loop []
         (when-some [fiber (a/<!! pending)]

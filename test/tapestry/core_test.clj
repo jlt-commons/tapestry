@@ -607,3 +607,13 @@
       (testing "timeout! stops a fiber parked in >!!"
         (let [f (sut/timeout! (sut/fiber (a/>!! (a/chan) :x)) 20)]
           (is (await-dead f 2000)))))))
+
+(deftest parallelly-bounded-order-test
+  (testing "bounded seq mode starts items in input order, so an early item can't starve behind later ones"
+    ;; With one permit, item 1 waits on something only item 0 produces. If item
+    ;; 1 could take the permit first, this would deadlock.
+    (dotimes [_ 30]
+      (let [p0     (promise)
+            f      (fn [x] (if (= x 0) (deliver p0 :zero) (deref p0 2000 :starved)))
+            result (future (sut/parallelly 1 f [0 1]))]
+        (is (= [p0 :zero] [p0 (second (deref result 5000 [nil :timed-out]))]))))))

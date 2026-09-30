@@ -39,6 +39,9 @@ now stops its body again, as it did on the JVM.
   Unbounded `asyncly` honors `with-max-parallelism` and no longer retains a
   handle per item.
 - `parallelly` interrupts the remaining calls on error.
+- Bounded `parallelly` starts items in input order. Each item's fiber used to
+  race for a permit, so under load later items could take every permit while
+  the caller waited on an earlier one, stalling the call.
 - `seq->stream` reports errors from realizing its seq to the stream error
   handler instead of swallowing them.
 
