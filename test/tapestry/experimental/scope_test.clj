@@ -273,3 +273,28 @@
           (tc/fiber (Thread/sleep 100) (reset! grandchild-done true))
           :child))
       (is (true? @grandchild-done)))))
+
+(deftest asyncly-inside-scope-test
+  (testing "an asyncly error inside an :on-failure scope surfaces as the real error"
+    (tc/set-stream-error-handler! (fn [& _]))
+    (try
+      (doseq [n [nil 2]]
+        (is (thrown-with-msg?
+              clojure.lang.ExceptionInfo #"real-error"
+              (sut/with-scope {:shutdown :on-failure}
+                (let [f (fn [x]
+                          (if (= x 0)
+                            (do (Thread/sleep 20) (throw (ex-info "real-error" {})))
+                            (Thread/sleep 30000)))]
+                  (doall (if n (tc/asyncly n f (range 4)) (tc/asyncly f (range 4)))))))
+            (str "n=" n)))
+      (finally (tc/set-stream-error-handler! println)))))
+
+(deftest body-error-not-masked-by-shutdown-test
+  (testing "the body's own error is rethrown, not the interrupts from shutting down"
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo #"body-error"
+          (sut/with-scope {:shutdown :on-failure}
+            (tc/fiber (Thread/sleep 30000))
+            (Thread/sleep 20)
+            (throw (ex-info "body-error" {})))))))

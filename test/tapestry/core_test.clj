@@ -458,3 +458,72 @@
       (Thread/sleep 20)
       (is (= :quick @f))
       (is (not (sut/errored? f))))))
+
+(defn- track-concurrency
+  "Wrap `f` so `state` records the peak number of concurrent calls."
+  [state f]
+  (fn [x]
+    (swap! state (fn [{:keys [running peak]}]
+                   {:running (inc running) :peak (max (or peak 0) (inc running))}))
+    (try (f x) (finally (swap! state update :running dec)))))
+
+(deftest asyncly-max-parallelism-test
+  (testing "unbounded asyncly honors with-max-parallelism"
+    (doseq [[mode run] [[:seq    #(doall (sut/asyncly %1 %2))]
+                        [:stream #(drain (sut/asyncly %1 (a/to-chan %2)))]]]
+      (let [state (atom {:running 0 :peak 0})
+            f     (track-concurrency state #(do (Thread/sleep 5) %))]
+        (is (= (range 30) (sort (sut/with-max-parallelism 3 (run f (range 30))))))
+        (is (<= (:peak @state) 3) (str mode " peak " (:peak @state)))))))
+
+(deftest asyncly-error-interrupts-workers-test
+  (doseq [[label n] [["unbounded" nil] ["bounded" 4]]]
+    (testing (str label " seq mode throws promptly and interrupts in-flight calls")
+      (sut/set-stream-error-handler! (fn [& _]))
+      (try
+        (let [interrupted (atom 0)
+              f           (fn [x]
+                            (if (= x 3)
+                              (do (Thread/sleep 50) (throw (ex-info "boom" {})))
+                              (try (Thread/sleep 30000)
+                                   (catch InterruptedException e
+                                     (swap! interrupted inc) (throw e)))))
+              result      (future
+                            (try (doall (if n (sut/asyncly n f (range 4)) (sut/asyncly f (range 4))))
+                                 (catch clojure.lang.ExceptionInfo e (ex-message e))))]
+          (is (= "boom" (deref result 5000 ::timed-out)))
+          (Thread/sleep 100)
+          (is (= 3 @interrupted)))
+        (finally (sut/set-stream-error-handler! println))))
+
+    (testing (str label " stream mode closes the result promptly and interrupts in-flight calls")
+      (sut/set-stream-error-handler! (fn [& _]))
+      (try
+        (let [interrupted (atom 0)
+              f           (fn [x]
+                            (if (= x 3)
+                              (do (Thread/sleep 50) (throw (ex-info "boom" {})))
+                              (try (Thread/sleep 30000)
+                                   (catch InterruptedException e
+                                     (swap! interrupted inc) (throw e)))))
+              src         (a/to-chan (range 4))
+              result      (if n (sut/asyncly n f src) (sut/asyncly f src))]
+          (is (= [] (first (a/alts!! [(a/into [] result) (a/timeout 5000)]))))
+          (Thread/sleep 100)
+          (is (= 3 @interrupted)))
+        (finally (sut/set-stream-error-handler! println))))))
+
+
+(deftest seq->stream-test
+  (testing "emits the seq and closes"
+    (is (= [0 1 2] (drain (sut/seq->stream (range 3))))))
+  (testing "reports an error realizing the seq and closes the channel"
+    (let [seen (promise)]
+      (sut/set-stream-error-handler! (fn [e _] (deliver seen (ex-message e))))
+      (try
+        ;; reduce realizes the tail before emitting the head, so the error
+        ;; may cut the output short by one item.
+        (is (#{[0] [0 1]} (drain (sut/seq->stream
+                                   (concat [0 1] (lazy-seq (throw (ex-info "seq-boom" {}))))))))
+        (is (= "seq-boom" (deref seen 1000 ::none)))
+        (finally (sut/set-stream-error-handler! println))))))

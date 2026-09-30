@@ -143,13 +143,12 @@
              (throw-if-failed! scope#)
              result#)
            (catch Throwable t#
-             (shutdown-all! scope#)
-             (await-all! scope#)
-             ;; If the scope recorded a real failure, prefer it: the caught
+             ;; If a fiber had already failed, prefer its error: the caught
              ;; throwable is often just the cascade from derefing a sibling
-             ;; whose result was cancelled (an interrupt/timeout), which would
-             ;; otherwise mask the original error.
-             (if (and (= :on-failure shutdown#)
-                      (realized? (:first-error scope#)))
-               (throw @(:first-error scope#))
-               (throw t#))))))))
+             ;; that failure cancelled. Check before shutting down, since the
+             ;; interrupts shutdown-all! delivers are recorded as failures too.
+             (let [failed?# (and (= :on-failure shutdown#)
+                                 (realized? (:first-error scope#)))]
+               (shutdown-all! scope#)
+               (await-all! scope#)
+               (throw (if failed?# @(:first-error scope#) t#)))))))))

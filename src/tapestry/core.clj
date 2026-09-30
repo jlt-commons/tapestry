@@ -224,7 +224,8 @@
                        (or (nil? sem) (acquire-permit fiber sem)))
                   (catch Throwable _ false))]
     (if-not permit?
-      (reset! (.alive* fiber) false)
+      (do (reset! (.alive* fiber) false)
+          (settle! fiber [:err (interrupted-ex)]))
       (let [outcome (try
                       [:ok (f)]
                       (catch Throwable e
@@ -239,23 +240,25 @@
 
 (defn ^:no-doc spawn-fiber!
   "Start `f` on a new daemon thread and return its `Fiber`. The fiber is
-  registered with the current scope and has any `with-timeout` applied before
-  its thread starts."
-  [f]
-  (let [sem    *local-semaphore*
-        ;; Not a promise: a fiber cancelled before its thread starts has the
-        ;; interrupt flag set, and a promise deref would throw on it.
-        ;; `.start` publishes the write to the new thread.
-        holder (volatile! nil)
-        thread (Thread. ^Runnable (bound-fn* (fn [] (run-fiber! @holder sem f))))
-        fiber  (Fiber. (promise) (atom true) (atom nil) (atom false)
-                       (a/chan) *scope-notify!* thread)]
-    (vreset! holder fiber)
-    (.setDaemon thread true)
-    (when *scope-register!* (*scope-register!* fiber))
-    (when *local-timeout* (timeout! fiber *local-timeout*))
-    (.start thread)
-    fiber))
+  registered with the current scope, has any `with-timeout` applied, and is
+  passed to `before-start` (if given) before its thread starts."
+  ([f] (spawn-fiber! f nil))
+  ([f before-start]
+   (let [sem    *local-semaphore*
+         ;; Not a promise: a fiber cancelled before its thread starts has the
+         ;; interrupt flag set, and a promise deref would throw on it.
+         ;; `.start` publishes the write to the new thread.
+         holder (volatile! nil)
+         thread (Thread. ^Runnable (bound-fn* (fn [] (run-fiber! @holder sem f))))
+         fiber  (Fiber. (promise) (atom true) (atom nil) (atom false)
+                        (a/chan) *scope-notify!* thread)]
+     (vreset! holder fiber)
+     (.setDaemon thread true)
+     (when *scope-register!* (*scope-register!* fiber))
+     (when *local-timeout* (timeout! fiber *local-timeout*))
+     (when before-start (before-start fiber))
+     (.start thread)
+     fiber)))
 
 (defmacro fiber
   "Execute `body` on its own thread, returning a derefable `Fiber`.
@@ -288,12 +291,15 @@
 (defmacro seq->stream
   "Runs an expression that returns a (presumably lazy) sequence on a dedicated
   thread and returns a channel onto which the results are put. The channel is
-  closed when the sequence is exhausted."
+  closed when the sequence is exhausted, or after an error realizing it is
+  passed to the stream error handler."
   [expr]
   `(let [out# (a/chan)]
      (a/thread
        (try
          (run! #(a/>!! out# %) ~expr)
+         (catch Exception e#
+           (when on-error (on-error e# "Error in seq->stream")))
          (finally (a/close! out#))))
      out#))
 
@@ -340,120 +346,67 @@
 ;; asyncly — concurrent, order-independent map
 ;; ---------------------------------------------------------------------------
 
-(defn- ^:no-doc asyncly-seq
-  "Unbounded parallelism over a seqable `s`; returns a seq."
-  [f s]
+(defn- run-asyncly!
+  "Map `f` over channel `src` onto channel `result` on fibers: `n` workers
+  pulling from `src`, or a fiber per item when `n` is nil. On the first error,
+  reports it to `on-error`, closes `src` and `result`, and interrupts the
+  in-flight calls. Otherwise `result` closes once every fiber has settled.
+  Returns an atom holding the first error, if any."
+  [n f src result]
+  (let [err     (atom nil)
+        ;; Thread -> Fiber for fibers whose work hasn't finished. Fibers are
+        ;; added before their thread starts and remove themselves when done.
+        running (atom {})
+        fail!   (fn [e]
+                  (when (compare-and-set! err nil e)
+                    (when on-error (on-error e "Exception in asyncly function"))
+                    (a/close! src)
+                    (a/close! result)
+                    (doseq [^Thread t (keys @running)]
+                      (when-not (identical? t (Thread/currentThread))
+                        (.interrupt t)))))
+        ;; Errors after the first, including the interrupts fail! causes,
+        ;; are dropped, so the fibers themselves always settle cleanly.
+        guard   (fn [body]
+                  (fn []
+                    (try (body)
+                         (catch Throwable e (when-not @err (fail! e)))
+                         (finally (swap! running dissoc (Thread/currentThread))))
+                    nil))
+        call!   (fn [item]
+                  (when-not @err
+                    (when-some [v (f item)] (a/>!! result v))))
+        spawn!  (fn [body]
+                  (spawn-fiber! (guard body)
+                                (fn [^Fiber fb] (swap! running assoc (.thread fb) fb))))
+        settle-all! (fn [fibers]
+                      (run! (fn [^Fiber fb] (a/<!! (.done fb))) fibers)
+                      (a/close! result))]
+    (if n
+      (let [worker #(loop []
+                      (when-some [item (a/<!! src)]
+                        (call! item)
+                        (recur)))
+            fibers (doall (repeatedly (max 1 n) #(spawn! worker)))]
+        (a/thread (settle-all! fibers)))
+      (a/thread
+        (loop []
+          (when-some [item (a/<!! src)]
+            (when-not @err
+              (spawn! #(call! item))
+              (recur))))
+        (settle-all! (vals @running))))
+    err))
+
+(defn- asyncly-seq [n f s]
   (let [result (a/chan)
-        error* (promise)
-        src    (a/to-chan s)
-        procs  (atom [])]
-    (a/thread
-      (loop []
-        (when-some [item (a/<!! src)]
-          (if (realized? error*)
-            (a/close! src)
-            (let [p (a/thread
-                      (try
-                        (when-not (realized? error*)
-                          (when-some [v (f item)]
-                            (a/>!! result v)))
-                        (catch Exception e#
-                          (when on-error (on-error e# "Exception in asyncly function"))
-                          (deliver error* e#)
-                          (a/close! src))))]
-              (swap! procs conj p)
-              (recur)))))
-      (run! a/<!! @procs)
-      (a/close! result))
+        err    (run-asyncly! n f (a/to-chan s) result)]
     (concat (a/<!! (a/into [] result))
-            (lazy-seq (when (realized? error*) (throw (deref error* 0 nil)))))))
+            (lazy-seq (when-let [e @err] (throw e))))))
 
-(defn- ^:no-doc asyncly-stream
-  "Unbounded parallelism over a channel `s`; returns a result channel."
-  [f s]
-  (let [result   (a/chan)
-        err-atom (atom nil)]
-    (a/thread
-      (let [procs (atom [])]
-        (loop []
-          (when-some [item (a/<!! s)]
-            (when-not @err-atom
-              (let [p (a/thread
-                        (try
-                          (when-not @err-atom (when-some [v (f item)] (a/>!! result v)))
-                          (catch Exception e#
-                            (when on-error (on-error e# "Exception in asyncly function"))
-                            (reset! err-atom e#)
-                            (a/close! s)
-                            (a/close! result))))]
-                (swap! procs conj p)))
-            (recur)))
-        ;; Wait for every spawned worker to finish before closing, so an
-        ;; in-flight worker's put is never dropped by an early close.
-        (run! a/<!! @procs))
-      (a/close! result))
-    result))
-
-(defn- ^:no-doc asyncly-seq-n
-  "Bounded (`n`) parallelism over a seqable `s`; returns a seq."
-  [n f s]
-  (let [result  (a/chan (a/buffer (max 1 n)))
-        error*  (promise)
-        src     (a/to-chan s)
-        work    (a/chan (max 1 n))
-        workers (atom n)]
-    (dotimes [_ n]
-      (a/thread
-        (loop []
-          (when-some [v (a/<!! work)]
-            (try
-              (when-not (realized? error*) (when-some [v (f v)] (a/>!! result v)))
-              (catch Exception e#
-                (when on-error (on-error e# "Error in asyncly callback"))
-                (deliver error* e#)
-                (a/close! work)
-                (a/close! result)))
-            (recur)))
-        (when (zero? (swap! workers dec))
-          (a/close! result))))
-    (a/thread
-      (loop []
-        (when-some [v (a/<!! src)]
-          (when-not (realized? error*)
-            (a/>!! work v)
-            (recur))))
-      (a/close! work))
-    (concat (a/<!! (a/into [] result))
-            (lazy-seq (when (realized? error*) (throw (deref error* 0 nil)))))))
-
-(defn- ^:no-doc asyncly-stream-n
-  "Bounded (`n`) parallelism over a channel `s`; returns a result channel."
-  [n f s]
-  (let [result   (a/chan)
-        err-atom (atom nil)
-        work     (a/chan (max 1 n))
-        workers  (atom n)]
-    (dotimes [_ n]
-      (a/thread
-        (loop []
-          (when-some [v (a/<!! work)]
-            (try
-              (when-not @err-atom (when-some [v (f v)] (a/>!! result v)))
-              (catch Exception e#
-                (when on-error (on-error e# "Error in asyncly callback"))
-                (reset! err-atom e#)
-                (a/close! work)
-                (a/close! s)))
-            (recur)))
-        (when (zero? (swap! workers dec))
-          (a/close! result))))
-    (a/thread
-      (loop []
-        (when-some [v (a/<!! s)]
-          (when-not @err-atom
-            (a/>!! work v)
-            (recur))))
-      (a/close! work))
+(defn- asyncly-stream [n f s]
+  (let [result (a/chan)]
+    (run-asyncly! n f s result)
     result))
 
 (defn asyncly
@@ -465,9 +418,9 @@
   With one arity, uses unbounded parallelism (or the max parallelism set via
   `with-max-parallelism`). With a numeric `n`, limits to `n` concurrent calls."
   ([f s]
-   (if (seqable? s) (asyncly-seq f s) (asyncly-stream f s)))
+   (if (seqable? s) (asyncly-seq nil f s) (asyncly-stream nil f s)))
   ([n f s]
-   (if (seqable? s) (asyncly-seq-n n f s) (asyncly-stream-n n f s))))
+   (if (seqable? s) (asyncly-seq n f s) (asyncly-stream n f s))))
 
 (defn parallelly
   "Maps `f` over the channel or seq `s` with up to `n` items occurring in
