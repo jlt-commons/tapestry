@@ -234,3 +234,42 @@
         (catch Exception _))
       (is (tc/errored? @slow-ref)
           "fibers should be cancelled when body throws"))))
+
+(deftest scope-captured-at-spawn-test
+  (testing "interrupting a scoped fiber from an unscoped thread still reaches its scope"
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo #"interrupted"
+          (sut/with-scope {:shutdown :on-failure}
+            (let [f (tc/fiber (Thread/sleep 30000))
+                  t (Thread. (fn [] (tc/interrupt! f)))]
+              (.start t)
+              (.join t))))))
+
+  (testing "interrupting an outer fiber from inside a nested scope does not fail the nested scope"
+    (let [inner-result (atom nil)]
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"interrupted"
+            (sut/with-scope {:shutdown :on-failure}
+              (let [outer (tc/fiber (Thread/sleep 30000))]
+                (reset! inner-result
+                        (sut/with-scope {:shutdown :on-failure}
+                          (tc/interrupt! outer)
+                          @(tc/fiber :inner-ok)))))))
+      (is (= :inner-ok @inner-result)))))
+
+(deftest scope-waits-for-bodies-test
+  (testing "scope exit waits for interrupted bodies to finish their cleanup"
+    (let [cleaned (atom false)]
+      (sut/with-scope {:shutdown :on-success}
+        (tc/fiber (try (Thread/sleep 30000)
+                       (finally (Thread/sleep 50) (reset! cleaned true))))
+        (tc/fiber :fast))
+      (is (true? @cleaned))))
+
+  (testing "fibers spawned by scoped fibers are awaited too"
+    (let [grandchild-done (atom false)]
+      (sut/with-scope {}
+        (tc/fiber
+          (tc/fiber (Thread/sleep 100) (reset! grandchild-done true))
+          :child))
+      (is (true? @grandchild-done)))))

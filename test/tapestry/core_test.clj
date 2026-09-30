@@ -395,3 +395,66 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"max-parallelism"
           (sut/with-max-parallelism 0
             (sut/fiber :x))))))
+
+(defn- await-dead
+  "Poll until `f` is no longer alive, or `ms` elapse. Returns true if dead."
+  [f ms]
+  (let [deadline (+ (System/currentTimeMillis) ms)]
+    (loop []
+      (cond (not (sut/alive? f))                      true
+            (> (System/currentTimeMillis) deadline)  false
+            :else                                    (do (Thread/sleep 5) (recur))))))
+
+(deftest cancellation-stops-body-test
+  (testing "interrupt! throws InterruptedException into a blocked body"
+    (let [seen (promise)
+          f    (sut/fiber
+                 (try (Thread/sleep 30000)
+                      (catch InterruptedException e (deliver seen :interrupted) (throw e))))]
+      (Thread/sleep 50)
+      (sut/interrupt! f)
+      (is (= :interrupted (deref seen 2000 :not-interrupted)))
+      (is (await-dead f 2000))
+      (is (= ::sut/interrupted (:type (ex-data (sut/fiber-error f)))))))
+
+  (testing "timeout! stops the body"
+    (let [f (sut/timeout! (sut/fiber (Thread/sleep 30000)) 20)]
+      (is (await-dead f 2000))
+      (is (thrown? clojure.lang.ExceptionInfo @f))))
+
+  (testing "timeout! with a default stops the body"
+    (let [f (sut/timeout! (sut/fiber (Thread/sleep 30000)) 20 :default)]
+      (is (= :default @f))
+      (is (await-dead f 2000))))
+
+  (testing "a body that ignores the interrupt keeps its cancelled result"
+    (let [f (sut/fiber (try (Thread/sleep 30000) (catch InterruptedException _ :swallowed)))]
+      (Thread/sleep 20)
+      (sut/interrupt! f)
+      (is (await-dead f 2000))
+      (is (thrown? clojure.lang.ExceptionInfo @f)))))
+
+(deftest cancelled-while-queued-test
+  (testing "a fiber cancelled while waiting for a permit never runs its body"
+    (let [gate    (promise)
+          holding (promise)
+          ran     (atom false)]
+      (sut/with-max-parallelism 1
+        (let [holder (sut/fiber (deliver holding true) @gate)
+              _      @holding
+              queued (sut/fiber (reset! ran true))]
+          (Thread/sleep 20)
+          (sut/interrupt! queued)
+          (is (await-dead queued 1000) "queued fiber should exit without a permit")
+          (deliver gate :go)
+          @holder
+          (Thread/sleep 50)
+          (is (false? @ran)))))))
+
+(deftest with-timeout-does-not-hold-completed-fibers-test
+  (testing "a fiber that finishes before its timeout keeps its value"
+    (let [f (sut/with-timeout 30000 (sut/fiber :quick))]
+      (is (= :quick @f))
+      (Thread/sleep 20)
+      (is (= :quick @f))
+      (is (not (sut/errored? f))))))

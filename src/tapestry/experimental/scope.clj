@@ -35,10 +35,10 @@
 
 (defn ^:no-doc register-fiber!
   "Register a fiber with the scope. Completion is handled by `notify-fiber!`,
-  wired up via `*scope-notify!*` (Jolt promises are not watchable)."
+  which the fiber captures from `*scope-notify!*` when it is spawned (Jolt
+  promises are not watchable)."
   [scope fiber]
-  (swap! (:fibers scope)
-         #(reduce conj PersistentQueue/EMPTY (conj (vec %) fiber)))
+  (swap! (:fibers scope) conj fiber)
   ;; If the scope has already shut down (an earlier fiber completed before this
   ;; one was registered), interrupt immediately.
   (case (:shutdown-policy scope)
@@ -68,10 +68,15 @@
       nil)))
 
 (defn ^:no-doc await-all!
-  "Wait for every registered fiber to complete (deref its result promise)."
+  "Wait for every registered fiber's thread to finish, including fibers that
+  running fibers register while we wait."
   [scope]
-  (doseq [^tapestry.core.Fiber fiber @(:fibers scope)]
-    @(.result fiber)))
+  (loop [joined 0]
+    (let [fibers @(:fibers scope)]
+      (when (< joined (count fibers))
+        (doseq [^tapestry.core.Fiber fiber (drop joined fibers)]
+          (.join ^Thread (.thread fiber)))
+        (recur (count fibers))))))
 
 (defn ^:no-doc shutdown-all!
   "Interrupt all fibers that are still alive in the scope."

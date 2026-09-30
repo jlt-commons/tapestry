@@ -5,12 +5,9 @@
   whose body runs on its own thread. Results, errors, timeouts, and
   cancellation all flow through that handle.
 
-  On Jolt there is no JVM thread interruption, so `interrupt!`/`timeout!`
-  deliver a cancellation to the fiber's result (a `deref` then sees it) but
-  cannot forcibly stop a body blocked on `Thread/sleep`. Cooperative bodies —
-  those that park on channel operations or check a cancellation flag — stop
-  promptly; a body pinned in a blocking call runs to completion in the
-  background while its result is reported as cancelled."
+  `interrupt!` and `timeout!` settle the fiber's result and interrupt its
+  thread, so a body blocked in `Thread/sleep`, a deref, or another
+  interruptible wait throws `InterruptedException`."
   (:require [clojure.core.async :as a])
   (:refer-clojure :exclude [send]))
 
@@ -36,8 +33,9 @@
 
 (def ^{:dynamic true :no-doc true} *scope-notify!*
   "A function called when a fiber completes, with [fiber outcome] where outcome
-  is `[:ok v]` or `[:err Throwable]`. Set by `tapestry.experimental/with-scope`.
-  Jolt promises are not watchable, so the fiber reports its own completion."
+  is `[:ok v]` or `[:err Throwable]`. Set by `tapestry.experimental/with-scope`
+  and captured by each fiber at spawn time. Jolt promises are not watchable,
+  so the fiber reports its own completion."
   nil)
 
 (def ^:no-doc on-error
@@ -61,7 +59,7 @@
 ;; ---------------------------------------------------------------------------
 
 ;; A counting semaphore built from a buffer-n channel prefilled with permits.
-;; `acquire` takes a permit (blocking when none remain), `release` returns one.
+;; A fiber takes a permit before running its body and puts it back after.
 (defn ^:no-doc make-semaphore
   [n]
   (when-not (pos? n)
@@ -71,8 +69,6 @@
     (dotimes [_ n] (a/>!! permits :permit))
     permits))
 
-(defn ^:no-doc acquire-semaphore [sem] (a/<!! sem))
-(defn ^:no-doc release-semaphore [sem] (a/>!! sem :permit))
 
 ;; The JVM's `TimeoutException`/`InterruptedException` have no constructors on
 ;; Jolt's shim, so cancellation surfaces as an `ex-info` with a `:type` tag.
@@ -101,9 +97,12 @@
 
 (deftype ^:no-doc Fiber
     [result        ;; clojure.core/promise: delivered [:ok v] | [:err Throwable]
-     alive*        ;; atom: true while the body's thread is running
+     alive*        ;; atom: true until the body's thread is done with the body
      err*          ;; atom: Throwable once the fiber has errored/been cancelled
-     settled*]     ;; atom: false until exactly one settlement claims the fiber
+     settled*      ;; atom: false until exactly one settlement claims the fiber
+     done          ;; core.async channel closed on settlement
+     on-settle     ;; the scope's completion callback at spawn time, or nil
+     thread]       ;; the java.lang.Thread running the body
   clojure.lang.IDeref
   (deref [_]
     (let [[tag val] @result]
@@ -136,16 +135,25 @@
     (.write w "}")))
 
 (defn ^:no-doc settle!
-  "Settle `fiber` with `outcome` exactly once. The winner of the CAS runs
-  fiber state updates and scope bookkeeping BEFORE delivering the result
-  promise, so waiters (deref, scope await-all!) never observe a settled
-  result whose scope state (first-error/first-result) is not yet recorded."
+  "Settle `fiber` with `outcome` exactly once, returning true for the caller
+  that won. The winner records fiber state and notifies the fiber's scope
+  BEFORE delivering the result promise, so waiters (deref, `alts`) never
+  observe a settled result whose scope state (first-error/first-result) is not
+  yet recorded."
   [^Fiber fiber [tag val :as outcome]]
   (when (compare-and-set! (.settled* fiber) false true)
     (when (= :err tag)
       (swap! (.err* fiber) (fn [old] (or old val))))
-    (when *scope-notify!* (*scope-notify!* fiber outcome))
-    (deliver (.result fiber) outcome)))
+    (when-let [on-settle (.on-settle fiber)] (on-settle fiber outcome))
+    (a/close! (.done fiber))
+    (deliver (.result fiber) outcome)
+    true))
+
+(defn- cancel!
+  "Settle `fiber` with `outcome` and, if that settled it, interrupt its thread."
+  [^Fiber fiber outcome]
+  (when (settle! fiber outcome)
+    (.interrupt ^Thread (.thread fiber))))
 
 (defn alive?
   "Return whether the provided `fiber` is still running."
@@ -163,42 +171,91 @@
   (when-not (alive? fiber) @(.err* fiber)))
 
 (defn interrupt!
-  "Cancel the provided `fiber`. A subsequent `deref` throws an
-  `InterruptedException`; callbacks registered on the fiber fire with the
-  cancellation.
-
-  On Jolt the cancellation is delivered to the result, but a body blocked on a
-  non-cooperative call (e.g. `Thread/sleep`) is not forcibly stopped — it runs
-  to completion in the background while its result is reported as cancelled.
+  "Cancel the provided `fiber` and interrupt its thread, so a blocking call in
+  the body throws `InterruptedException`. A subsequent `deref` throws
+  `ExceptionInfo` with `{:type :tapestry.core/interrupted}`. No effect on a
+  fiber that has already completed.
 
   Returns the provided `fiber` for chaining."
   [^Fiber fiber]
-  (settle! fiber [:err (interrupted-ex)])
+  (cancel! fiber [:err (interrupted-ex)])
   fiber)
 
 (defn timeout!
-  "Set the provided `timeout` on the `fiber`. When it elapses the fiber is
-  cancelled (see `interrupt!`).
+  "Set the provided `timeout` on the `fiber`. If the fiber has not completed
+  when it elapses, it is cancelled and its thread interrupted (see
+  `interrupt!`).
 
-  Without a `default`, a `deref` after the timeout throws
-  `java.util.concurrent.TimeoutException`. With a `default`, the `deref`
-  returns `default` instead.
+  Without a `default`, a `deref` after the timeout throws `ExceptionInfo` with
+  `{:type :tapestry.core/timeout}`. With a `default`, the `deref` returns
+  `default` instead.
 
   Accepts either a number of millis or a `java.time.Duration`.
 
   Returns the provided `fiber` for chaining."
-  ([^Fiber fiber timeout]
-   (let [ms (->ms timeout)]
-      (a/thread
-        (a/<!! (a/timeout ms))
-        (settle! fiber [:err (timeout-ex)]))
-      fiber))
+  ([fiber timeout]
+   (timeout! fiber timeout ::no-default))
   ([^Fiber fiber timeout default]
-   (let [ms (->ms timeout)]
+   (let [ms   (->ms timeout)
+         done (.done fiber)]
      (a/thread
-       (a/<!! (a/timeout ms))
-       (settle! fiber [:ok default]))
+       (let [[_ port] (a/alts!! [done (a/timeout ms)] :priority true)]
+         (when-not (identical? port done)
+           (cancel! fiber (if (identical? ::no-default default)
+                            [:err (timeout-ex)]
+                            [:ok default])))))
      fiber)))
+
+(defn- acquire-permit
+  "Take a permit from `sem`, giving up if `fiber` settles first. Returns true
+  when a permit was taken."
+  [^Fiber fiber sem]
+  (let [done (.done fiber)
+        [_ port] (a/alts!! [done sem] :priority true)]
+    (not (identical? port done))))
+
+(defn ^:no-doc run-fiber!
+  "Body of a fiber's thread: wait for a permit if `sem` is set, run `f`, and
+  settle `fiber` with the outcome. A fiber cancelled before it starts, or
+  while queued for a permit, never runs `f`."
+  [^Fiber fiber sem f]
+  (let [permit? (try
+                  (and (not @(.settled* fiber))
+                       (or (nil? sem) (acquire-permit fiber sem)))
+                  (catch Throwable _ false))]
+    (if-not permit?
+      (reset! (.alive* fiber) false)
+      (let [outcome (try
+                      [:ok (f)]
+                      (catch Throwable e
+                        (swap! (.err* fiber) (fn [old] (or old e)))
+                        [:err e])
+                      (finally
+                        ;; put! never blocks, so an interrupt flag left set by
+                        ;; the body can't abort returning the permit.
+                        (when sem (a/put! sem :permit))
+                        (reset! (.alive* fiber) false)))]
+        (settle! fiber outcome)))))
+
+(defn ^:no-doc spawn-fiber!
+  "Start `f` on a new daemon thread and return its `Fiber`. The fiber is
+  registered with the current scope and has any `with-timeout` applied before
+  its thread starts."
+  [f]
+  (let [sem    *local-semaphore*
+        ;; Not a promise: a fiber cancelled before its thread starts has the
+        ;; interrupt flag set, and a promise deref would throw on it.
+        ;; `.start` publishes the write to the new thread.
+        holder (volatile! nil)
+        thread (Thread. ^Runnable (bound-fn* (fn [] (run-fiber! @holder sem f))))
+        fiber  (Fiber. (promise) (atom true) (atom nil) (atom false)
+                       (a/chan) *scope-notify!* thread)]
+    (vreset! holder fiber)
+    (.setDaemon thread true)
+    (when *scope-register!* (*scope-register!* fiber))
+    (when *local-timeout* (timeout! fiber *local-timeout*))
+    (.start thread)
+    fiber))
 
 (defmacro fiber
   "Execute `body` on its own thread, returning a derefable `Fiber`.
@@ -206,27 +263,7 @@
   Honors any active `with-max-parallelism` semaphore and `with-timeout`, and
   registers the fiber with the current scope (`with-scope`) if one is active."
   [& body]
-  `(let [result# (promise)
-         alive?# (atom true)
-         err*#   (atom nil)
-         settled*# (atom false)
-         fiber*# (promise)]
-     (a/thread
-       (when *local-semaphore* (acquire-semaphore *local-semaphore*))
-       (let [outcome# (try
-                        [:ok (do ~@body)]
-                        (catch Throwable e#
-                          (swap! err*# (fn [old#] (or old# e#)))
-                          [:err e#])
-                         (finally
-                           (when *local-semaphore* (release-semaphore *local-semaphore*))
-                           (reset! alive?# false)))]
-         (settle! @fiber*# outcome#)))
-     (let [fiber# (Fiber. result# alive?# err*# settled*#)]
-       (deliver fiber*# fiber#)
-       (when *scope-register!* (*scope-register!* fiber#))
-       (when *local-timeout* (timeout! fiber# *local-timeout*))
-       fiber#)))
+  `(spawn-fiber! (fn [] ~@body)))
 
 (defmacro with-max-parallelism
   "Executes the provided body such that at most `n` fibers spawned within it
