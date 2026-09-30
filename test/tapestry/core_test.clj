@@ -243,14 +243,14 @@
                              (ex-message e))))]
       (is (= "boom" (deref result 5000 ::timed-out)))))
 
-  (testing "propagates errors with bounded parallelism over a stream"
-    (let [boom   (fn [x] (if (= x 3) (throw (ex-info "boom" {:x x})) (inc x)))
-          result (future (try
-                           (doall (drain (sut/parallelly 2 boom (a/to-chan [1 2 3 4 5]))))
-                           ::no-throw
-                           (catch clojure.lang.ExceptionInfo e
-                             (ex-message e))))]
-      (is (= "boom" (deref result 5000 ::timed-out))))))
+  (testing "a stream-mode error goes to the error handler and closes the result"
+    (let [seen   (promise)
+          boom   (fn [x] (if (= x 3) (throw (ex-info "boom" {:x x})) (inc x)))]
+      (sut/set-stream-error-handler! (fn [e _] (deliver seen (ex-message e))))
+      (try
+        (is (= [2 3] (drain (sut/parallelly 2 boom (a/to-chan [1 2 3 4 5])))))
+        (is (= "boom" (deref seen 1000 ::none)))
+        (finally (sut/set-stream-error-handler! println))))))
 
 (deftest locking-test
   (testing "locking works"
@@ -526,4 +526,59 @@
         (is (#{[0] [0 1]} (drain (sut/seq->stream
                                    (concat [0 1] (lazy-seq (throw (ex-info "seq-boom" {}))))))))
         (is (= "seq-boom" (deref seen 1000 ::none)))
+        (finally (sut/set-stream-error-handler! println))))))
+
+(deftest parallelly-streaming-test
+  (testing "stream mode emits before the source is exhausted"
+    (let [out (sut/parallelly 2 inc (a/to-chan (range)))]
+      (is (= [1 2 3] (repeatedly 3 #(first (a/alts!! [out (a/timeout 2000)])))))
+      (a/close! out))
+    (let [src (a/chan)
+          out (sut/parallelly inc src)]
+      (a/>!! src 1)
+      (is (= 2 (first (a/alts!! [out (a/timeout 2000)]))))
+      (a/close! src)
+      (is (nil? (first (a/alts!! [out (a/timeout 2000)]))))))
+
+  (testing "stream mode preserves order and bounds parallelism"
+    (let [state (atom {:running 0 :peak 0})
+          f     (track-concurrency state #(do (Thread/sleep (rand-int 10)) %))]
+      (is (= (range 30) (drain (sut/parallelly 3 f (a/to-chan (range 30))))))
+      (is (<= (:peak @state) 3))))
+
+  (testing "nil results are dropped in stream mode and kept in seq mode"
+    (is (= [1 3] (drain (sut/parallelly 2 #(when (odd? %) %) (a/to-chan [1 2 3])))))
+    (is (= [1 nil 3] (sut/parallelly 2 #(when (odd? %) %) [1 2 3])))))
+
+(deftest parallelly-error-interrupts-test
+  (doseq [n [nil 2]]
+    (testing (str "n=" n " seq mode interrupts the remaining calls")
+      (let [interrupted (atom 0)
+            f           (fn [x]
+                          (if (= x 0)
+                            (do (Thread/sleep 50) (throw (ex-info "boom" {})))
+                            (try (Thread/sleep 30000)
+                                 (catch InterruptedException e (swap! interrupted inc) (throw e)))))
+            result      (future (try (if n (sut/parallelly n f (range 3)) (sut/parallelly f (range 3)))
+                                     (catch clojure.lang.ExceptionInfo e (ex-message e))))]
+        (is (= "boom" (deref result 5000 ::timed-out)))
+        (Thread/sleep 100)
+        ;; with n=2 the third call may start on the failed call's permit
+        ;; before the error is seen; it is then interrupted too
+        (is ((if n #{1 2} #{2}) @interrupted))))
+
+    (testing (str "n=" n " stream mode interrupts in-flight calls")
+      (sut/set-stream-error-handler! (fn [& _]))
+      (try
+        (let [interrupted (atom 0)
+              f           (fn [x]
+                            (if (= x 0)
+                              (do (Thread/sleep 50) (throw (ex-info "boom" {})))
+                              (try (Thread/sleep 30000)
+                                   (catch InterruptedException e (swap! interrupted inc) (throw e)))))
+              src         (a/to-chan (range 3))
+              out         (if n (sut/parallelly n f src) (sut/parallelly f src))]
+          (is (= [] (first (a/alts!! [(a/into [] out) (a/timeout 5000)]))))
+          (Thread/sleep 100)
+          (is ((if n #{1 2} #{2}) @interrupted)))
         (finally (sut/set-stream-error-handler! println))))))

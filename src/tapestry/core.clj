@@ -342,6 +342,15 @@
          (finally (a/close! out))))
      out)))
 
+(defn- interrupt-thread!
+  "Interrupt the thread running `fiber` without settling it, unless that is
+  the calling thread. Used by asyncly/parallelly, whose fibers catch their
+  own errors so an internal cancel isn't recorded by an enclosing scope."
+  [^Fiber fiber]
+  (let [^Thread t (.thread fiber)]
+    (when-not (identical? t (Thread/currentThread))
+      (.interrupt t))))
+
 ;; ---------------------------------------------------------------------------
 ;; asyncly — concurrent, order-independent map
 ;; ---------------------------------------------------------------------------
@@ -362,9 +371,7 @@
                     (when on-error (on-error e "Exception in asyncly function"))
                     (a/close! src)
                     (a/close! result)
-                    (doseq [^Thread t (keys @running)]
-                      (when-not (identical? t (Thread/currentThread))
-                        (.interrupt t)))))
+                    (run! interrupt-thread! (vals @running))))
         ;; Errors after the first, including the interrupts fail! causes,
         ;; are dropped, so the fibers themselves always settle cleanly.
         guard   (fn [body]
@@ -422,24 +429,85 @@
   ([n f s]
    (if (seqable? s) (asyncly-seq n f s) (asyncly-stream n f s))))
 
+(defn- guarded
+  "A thunk calling `(f x)` that returns `[:ok v]` or `[:err e]` rather than
+  throwing."
+  [f x]
+  (fn [] (try [:ok (f x)] (catch Throwable e [:err e]))))
+
+(defn- outcome
+  "The tagged outcome of a `guarded` fiber, or `[:err e]` if the fiber itself
+  was cancelled."
+  [fiber]
+  (try @fiber (catch Throwable e [:err e])))
+
+(defn- parallelly-seq [n f s]
+  (let [spawn  #(spawn-fiber! (guarded f %))
+        fibers (if n
+                 (binding [*local-semaphore* (make-semaphore (max 1 n))]
+                   (mapv spawn s))
+                 (mapv spawn s))]
+    (loop [acc (transient []) i 0]
+      (if (= i (count fibers))
+        (persistent! acc)
+        (let [[tag v] (outcome (nth fibers i))]
+          (if (= :ok tag)
+            (recur (conj! acc v) (inc i))
+            (do (run! interrupt-thread! (subvec fibers (inc i)))
+                (throw v))))))))
+
+(defn- parallelly-stream [n f src]
+  (let [out     (a/chan)
+        ;; Fibers in input order. Bounds read-ahead to `n` for bounded calls.
+        pending (a/chan (if n (max 1 n) Integer/MAX_VALUE))
+        stopped (atom false)
+        stop!   (fn [e]
+                  (when (compare-and-set! stopped false true)
+                    (when (and e on-error) (on-error e "Exception in parallelly function"))
+                    (a/close! src)
+                    (a/close! out)
+                    (a/close! pending)
+                    (loop []
+                      (when-some [fiber (a/poll! pending)]
+                        (interrupt-thread! fiber)
+                        (recur)))))]
+    (binding [*local-semaphore* (if n (make-semaphore (max 1 n)) *local-semaphore*)]
+      (a/thread
+        (loop []
+          (when-some [item (a/<!! src)]
+            (let [fiber (spawn-fiber! (guarded f item))]
+              (if (a/>!! pending fiber)
+                (recur)
+                (interrupt-thread! fiber)))))
+        (a/close! pending)))
+    (a/thread
+      (loop []
+        (when-some [fiber (a/<!! pending)]
+          (let [[tag v] (outcome fiber)]
+            (cond
+              (= :err tag)                        (stop! v)
+              (and (some? v) (not (a/>!! out v))) (stop! nil)
+              :else                               (recur)))))
+      (a/close! out))
+    out))
+
 (defn parallelly
   "Maps `f` over the channel or seq `s` with up to `n` items occurring in
   parallel, preserving order.
 
   With one arity, uses unbounded parallelism (or the max parallelism set via
-  `with-max-parallelism`). Returns a channel when `s` is a channel, else a seq."
+  `with-max-parallelism`).
+
+  Over a seq, returns a vector; the first error is thrown after interrupting
+  the remaining calls. Over a channel, returns a channel that emits results as
+  they become available in order (nil results are dropped); the first error
+  is passed to the stream error handler, the remaining calls are interrupted,
+  and both channels are closed. Closing the returned channel also stops the
+  work."
   ([f s]
-   (let [stream? (not (seqable? s))
-         items   (if stream? (a/<!! (a/into [] s)) (seq s))
-         results (->> items (mapv #(fiber (f %))) (mapv deref))]
-     (if stream? (a/to-chan results) results)))
+   (if (seqable? s) (parallelly-seq nil f s) (parallelly-stream nil f s)))
   ([n f s]
-   (let [seq?    (seqable? s)
-         items   (if seq? (seq s) (a/<!! (a/into [] s)))
-         sem     (make-semaphore (max 1 n))
-         results (binding [*local-semaphore* sem]
-                   (->> items (mapv #(fiber (f %))) (mapv deref)))]
-     (if seq? results (a/to-chan results)))))
+   (if (seqable? s) (parallelly-seq n f s) (parallelly-stream n f s))))
 
 (defn send
   "Dispatch an agent action via a dedicated thread (the Jolt analog of a loom
