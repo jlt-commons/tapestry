@@ -260,10 +260,15 @@
 
 (deftest scope-waits-for-bodies-test
   (testing "scope exit waits for interrupted bodies to finish their cleanup"
-    (let [cleaned (atom false)]
+    (let [cleaned (atom false)
+          started (promise)]
       (sut/with-scope {:shutdown :on-success}
-        (tc/fiber (try (Thread/sleep 30000)
+        (tc/fiber (try (deliver started true)
+                       (Thread/sleep 30000)
                        (finally (Thread/sleep 50) (reset! cleaned true))))
+        ;; otherwise :fast can win before the slow body starts, and a fiber
+        ;; cancelled before it starts never runs its body
+        @started
         (tc/fiber :fast))
       (is (true? @cleaned))))
 
