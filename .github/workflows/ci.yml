@@ -22,7 +22,7 @@ jobs:
       - name: Install jolt
         run: |
           curl -sSL -o jolt.tar.gz \
-            https://github.com/jolt-lang/jolt/releases/download/v0.7.11/jolt-v0.7.11-x86_64-linux.tar.gz
+            https://github.com/jolt-lang/jolt/releases/download/v0.8.15/jolt-v0.8.15-x86_64-linux.tar.gz
           mkdir -p "$HOME/.local/bin" /tmp/jolt-extract
           tar -xzf jolt.tar.gz -C /tmp/jolt-extract
           find /tmp/jolt-extract -name jolt -type f -exec install -m 755 {} "$HOME/.local/bin/jolt" \;

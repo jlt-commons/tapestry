@@ -62,7 +62,7 @@
 
 ;; A counting semaphore built from a buffer-n channel prefilled with permits.
 ;; `acquire` takes a permit (blocking when none remain), `release` returns one.
-(defn- ^:no-doc make-semaphore
+(defn ^:no-doc make-semaphore
   [n]
   (when-not (pos? n)
     (throw (ex-info "max-parallelism must be a positive integer"
@@ -71,8 +71,8 @@
     (dotimes [_ n] (a/>!! permits :permit))
     permits))
 
-(defn- acquire-semaphore [sem] (a/<!! sem))
-(defn- release-semaphore [sem] (a/>!! sem :permit))
+(defn ^:no-doc acquire-semaphore [sem] (a/<!! sem))
+(defn ^:no-doc release-semaphore [sem] (a/>!! sem :permit))
 
 ;; The JVM's `TimeoutException`/`InterruptedException` have no constructors on
 ;; Jolt's shim, so cancellation surfaces as an `ex-info` with a `:type` tag.
