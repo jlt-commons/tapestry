@@ -27,7 +27,7 @@ manifold/`java.util.concurrent` substrate with `core.async`.
 
 ## Installation
 
-Requires the [jolt](https://jolt-lang.github.io/) binary, version 0.8.15 or
+Requires the [jolt](https://jolt-lang.github.io/) binary, version 0.8.16 or
 later. Add to your deps.edn:
 
 ```
@@ -311,11 +311,6 @@ capacity for a bounded queue or `:unbounded`.
   `locking` monitor), runs until it reaches one, and its result is reported as
   cancelled in the meantime. A scope waits for such bodies on exit, so check
   `(Thread/interrupted)` in long loops.
-- `clojure.core.async` blocking ops (`<!!`, `>!!`, `alts!!`), and the
-  `tapestry.queue` operations built on them, ignore thread interrupts on jolt
-  0.8.15 and earlier. A fiber parked in one there is not stopped by
-  `interrupt!`/`timeout!` until the operation completes, and holds up the exit
-  of its scope until then. Later jolt releases interrupt them.
 - `with-max-parallelism` and `with-scope :max-parallelism` require a positive
   integer; other values throw at scope entry.
 

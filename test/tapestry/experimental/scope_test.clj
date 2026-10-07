@@ -306,14 +306,12 @@
             (throw (ex-info "body-error" {})))))))
 
 (deftest scope-exit-with-channel-wait-test
-  (if-not (force @(requiring-resolve 'tapestry.core-test/channel-ops-interruptible?))
-    (println "skipping scope-exit-with-channel-wait-test: this jolt can't interrupt <!!")
-    (testing "an :on-success scope exits when a sibling is parked on a channel"
-      (let [result (future (sut/with-scope {:shutdown :on-success}
-                             (tc/fiber (a/<!! (a/chan)))
-                             (tc/fiber :fast)
-                             :done))]
-        (is (= :done (deref result 3000 ::hung)))))))
+  (testing "an :on-success scope exits when a sibling is parked on a channel"
+    (let [result (future (sut/with-scope {:shutdown :on-success}
+                           (tc/fiber (a/<!! (a/chan)))
+                           (tc/fiber :fast)
+                           :done))]
+      (is (= :done (deref result 3000 ::hung))))))
 
 (deftest asyncly-queued-workers-inside-scope-test
   (testing "with fibers queued for permits, the real asyncly error still surfaces"

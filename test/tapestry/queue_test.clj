@@ -128,15 +128,13 @@
     (is true)))
 
 (deftest queue--interrupt-blocked-take-test
-  (if-not (force @(requiring-resolve 'tapestry.core-test/channel-ops-interruptible?))
-    (println "skipping queue--interrupt-blocked-take-test: this jolt can't interrupt <!!")
-    (let [q (sut/queue)
-          f (tc/fiber (sut/take! q))]
-      (Thread/sleep 20)
-      (tc/interrupt! f)
-      (Thread/sleep 50)
-      (is (not (tc/alive? f)))
-      (testing "the interrupted take didn't claim a later item"
-        (let [taker (tc/fiber (sut/take! q))]
-          (is (true? (sut/put! q :item)))
-          (is (= :item (deref taker 1000 ::timeout))))))))
+  (let [q (sut/queue)
+        f (tc/fiber (sut/take! q))]
+    (Thread/sleep 20)
+    (tc/interrupt! f)
+    (Thread/sleep 50)
+    (is (not (tc/alive? f)))
+    (testing "the interrupted take didn't claim a later item"
+      (let [taker (tc/fiber (sut/take! q))]
+        (is (true? (sut/put! q :item)))
+        (is (= :item (deref taker 1000 ::timeout)))))))

@@ -2,20 +2,18 @@
 
 ## 0.6.0
 
-Catches up with jolt 0.8.15, which can interrupt threads: cancelling a fiber
+Catches up with jolt 0.8.16, which can interrupt threads: cancelling a fiber
 now stops its body again, as it did on the JVM.
 
 ### Breaking Changes
 
-- Requires jolt 0.8.15 or later.
+- Requires jolt 0.8.16 or later.
 - `parallelly` over a channel streams results in order instead of reading the
   whole source first. A failure goes to the stream error handler and closes the
   result channel instead of being thrown from the `parallelly` call; nil
   results are dropped. Seq mode is unchanged.
 - Scope exit waits for fiber threads to finish, not just for their results to
-  settle. On jolt 0.8.15, whose core.async blocking ops ignore interrupts, a
-  fiber parked in `<!!`/`>!!`/`alts!!` holds up scope exit until the op
-  completes.
+  settle.
 
 ### Fixes
 
