@@ -166,10 +166,8 @@
         (sut/set-stream-error-handler! println))))
 
   (testing "bounded - error propagates despite blocked workers"
-    ;; On Jolt, Thread/sleep cannot be forcibly interrupted, so blocked workers
-    ;; run to completion in the background while the error is reported promptly
-    ;; (the result stream closes on error). The call must throw well before the
-    ;; 30s sleeps would finish.
+    ;; The blocked workers are interrupted, so the call throws well before
+    ;; the 30s sleeps would finish.
     (sut/set-stream-error-handler! (fn [& _]))
     (try
       (let [result* (promise)]
@@ -243,14 +241,14 @@
                              (ex-message e))))]
       (is (= "boom" (deref result 5000 ::timed-out)))))
 
-  (testing "propagates errors with bounded parallelism over a stream"
-    (let [boom   (fn [x] (if (= x 3) (throw (ex-info "boom" {:x x})) (inc x)))
-          result (future (try
-                           (doall (drain (sut/parallelly 2 boom (a/to-chan [1 2 3 4 5]))))
-                           ::no-throw
-                           (catch clojure.lang.ExceptionInfo e
-                             (ex-message e))))]
-      (is (= "boom" (deref result 5000 ::timed-out))))))
+  (testing "a stream-mode error goes to the error handler and closes the result"
+    (let [seen   (promise)
+          boom   (fn [x] (if (= x 3) (throw (ex-info "boom" {:x x})) (inc x)))]
+      (sut/set-stream-error-handler! (fn [e _] (deliver seen (ex-message e))))
+      (try
+        (is (= [2 3] (drain (sut/parallelly 2 boom (a/to-chan [1 2 3 4 5])))))
+        (is (= "boom" (deref seen 1000 ::none)))
+        (finally (sut/set-stream-error-handler! println))))))
 
 (deftest locking-test
   (testing "locking works"
@@ -395,3 +393,210 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"max-parallelism"
           (sut/with-max-parallelism 0
             (sut/fiber :x))))))
+
+(defn- await-dead
+  "Poll until `f` is no longer alive, or `ms` elapse. Returns true if dead."
+  [f ms]
+  (let [deadline (+ (System/currentTimeMillis) ms)]
+    (loop []
+      (cond (not (sut/alive? f))                      true
+            (> (System/currentTimeMillis) deadline)  false
+            :else                                    (do (Thread/sleep 5) (recur))))))
+
+(deftest cancellation-stops-body-test
+  (testing "interrupt! throws InterruptedException into a blocked body"
+    (let [seen (promise)
+          f    (sut/fiber
+                 (try (Thread/sleep 30000)
+                      (catch InterruptedException e (deliver seen :interrupted) (throw e))))]
+      (Thread/sleep 50)
+      (sut/interrupt! f)
+      (is (= :interrupted (deref seen 2000 :not-interrupted)))
+      (is (await-dead f 2000))
+      (is (= ::sut/interrupted (:type (ex-data (sut/fiber-error f)))))))
+
+  (testing "timeout! stops the body"
+    (let [f (sut/timeout! (sut/fiber (Thread/sleep 30000)) 20)]
+      (is (await-dead f 2000))
+      (is (thrown? clojure.lang.ExceptionInfo @f))))
+
+  (testing "timeout! with a default stops the body"
+    (let [f (sut/timeout! (sut/fiber (Thread/sleep 30000)) 20 :default)]
+      (is (= :default @f))
+      (is (await-dead f 2000))))
+
+  (testing "a body that ignores the interrupt keeps its cancelled result"
+    (let [f (sut/fiber (try (Thread/sleep 30000) (catch InterruptedException _ :swallowed)))]
+      (Thread/sleep 20)
+      (sut/interrupt! f)
+      (is (await-dead f 2000))
+      (is (thrown? clojure.lang.ExceptionInfo @f)))))
+
+(deftest cancelled-while-queued-test
+  (testing "a fiber cancelled while waiting for a permit never runs its body"
+    (let [gate    (promise)
+          holding (promise)
+          ran     (atom false)]
+      (sut/with-max-parallelism 1
+        (let [holder (sut/fiber (deliver holding true) @gate)
+              _      @holding
+              queued (sut/fiber (reset! ran true))]
+          (Thread/sleep 20)
+          (sut/interrupt! queued)
+          (is (await-dead queued 1000) "queued fiber should exit without a permit")
+          (deliver gate :go)
+          @holder
+          (Thread/sleep 50)
+          (is (false? @ran)))))))
+
+(deftest with-timeout-does-not-hold-completed-fibers-test
+  (testing "a fiber that finishes before its timeout keeps its value"
+    (let [f (sut/with-timeout 30000 (sut/fiber :quick))]
+      (is (= :quick @f))
+      (Thread/sleep 20)
+      (is (= :quick @f))
+      (is (not (sut/errored? f))))))
+
+(defn- track-concurrency
+  "Wrap `f` so `state` records the peak number of concurrent calls."
+  [state f]
+  (fn [x]
+    (swap! state (fn [{:keys [running peak]}]
+                   {:running (inc running) :peak (max (or peak 0) (inc running))}))
+    (try (f x) (finally (swap! state update :running dec)))))
+
+(deftest asyncly-max-parallelism-test
+  (testing "unbounded asyncly honors with-max-parallelism"
+    (doseq [[mode run] [[:seq    #(doall (sut/asyncly %1 %2))]
+                        [:stream #(drain (sut/asyncly %1 (a/to-chan %2)))]]]
+      (let [state (atom {:running 0 :peak 0})
+            f     (track-concurrency state #(do (Thread/sleep 5) %))]
+        (is (= (range 30) (sort (sut/with-max-parallelism 3 (run f (range 30))))))
+        (is (<= (:peak @state) 3) (str mode " peak " (:peak @state)))))))
+
+(deftest asyncly-error-interrupts-workers-test
+  (doseq [[label n] [["unbounded" nil] ["bounded" 4]]]
+    (testing (str label " seq mode throws promptly and interrupts in-flight calls")
+      (sut/set-stream-error-handler! (fn [& _]))
+      (try
+        (let [interrupted (atom 0)
+              f           (fn [x]
+                            (if (= x 3)
+                              (do (Thread/sleep 50) (throw (ex-info "boom" {})))
+                              (try (Thread/sleep 30000)
+                                   (catch InterruptedException e
+                                     (swap! interrupted inc) (throw e)))))
+              result      (future
+                            (try (doall (if n (sut/asyncly n f (range 4)) (sut/asyncly f (range 4))))
+                                 (catch clojure.lang.ExceptionInfo e (ex-message e))))]
+          (is (= "boom" (deref result 5000 ::timed-out)))
+          (Thread/sleep 100)
+          (is (= 3 @interrupted)))
+        (finally (sut/set-stream-error-handler! println))))
+
+    (testing (str label " stream mode closes the result promptly and interrupts in-flight calls")
+      (sut/set-stream-error-handler! (fn [& _]))
+      (try
+        (let [interrupted (atom 0)
+              f           (fn [x]
+                            (if (= x 3)
+                              (do (Thread/sleep 50) (throw (ex-info "boom" {})))
+                              (try (Thread/sleep 30000)
+                                   (catch InterruptedException e
+                                     (swap! interrupted inc) (throw e)))))
+              src         (a/to-chan (range 4))
+              result      (if n (sut/asyncly n f src) (sut/asyncly f src))]
+          (is (= [] (first (a/alts!! [(a/into [] result) (a/timeout 5000)]))))
+          (Thread/sleep 100)
+          (is (= 3 @interrupted)))
+        (finally (sut/set-stream-error-handler! println))))))
+
+
+(deftest seq->stream-test
+  (testing "emits the seq and closes"
+    (is (= [0 1 2] (drain (sut/seq->stream (range 3))))))
+  (testing "reports an error realizing the seq and closes the channel"
+    (let [seen (promise)]
+      (sut/set-stream-error-handler! (fn [e _] (deliver seen (ex-message e))))
+      (try
+        ;; reduce realizes the tail before emitting the head, so the error
+        ;; may cut the output short by one item.
+        (is (#{[0] [0 1]} (drain (sut/seq->stream
+                                   (concat [0 1] (lazy-seq (throw (ex-info "seq-boom" {}))))))))
+        (is (= "seq-boom" (deref seen 1000 ::none)))
+        (finally (sut/set-stream-error-handler! println))))))
+
+(deftest parallelly-streaming-test
+  (testing "stream mode emits before the source is exhausted"
+    (let [out (sut/parallelly 2 inc (a/to-chan (range)))]
+      (is (= [1 2 3] (repeatedly 3 #(first (a/alts!! [out (a/timeout 2000)])))))
+      (a/close! out))
+    (let [src (a/chan)
+          out (sut/parallelly inc src)]
+      (a/>!! src 1)
+      (is (= 2 (first (a/alts!! [out (a/timeout 2000)]))))
+      (a/close! src)
+      (is (nil? (first (a/alts!! [out (a/timeout 2000)]))))))
+
+  (testing "stream mode preserves order and bounds parallelism"
+    (let [state (atom {:running 0 :peak 0})
+          f     (track-concurrency state #(do (Thread/sleep (rand-int 10)) %))]
+      (is (= (range 30) (drain (sut/parallelly 3 f (a/to-chan (range 30))))))
+      (is (<= (:peak @state) 3))))
+
+  (testing "nil results are dropped in stream mode and kept in seq mode"
+    (is (= [1 3] (drain (sut/parallelly 2 #(when (odd? %) %) (a/to-chan [1 2 3])))))
+    (is (= [1 nil 3] (sut/parallelly 2 #(when (odd? %) %) [1 2 3])))))
+
+(deftest parallelly-error-interrupts-test
+  (doseq [n [nil 2]]
+    (testing (str "n=" n " seq mode interrupts the remaining calls")
+      (let [interrupted (atom 0)
+            f           (fn [x]
+                          (if (= x 0)
+                            (do (Thread/sleep 50) (throw (ex-info "boom" {})))
+                            (try (Thread/sleep 30000)
+                                 (catch InterruptedException e (swap! interrupted inc) (throw e)))))
+            result      (future (try (if n (sut/parallelly n f (range 3)) (sut/parallelly f (range 3)))
+                                     (catch clojure.lang.ExceptionInfo e (ex-message e))))]
+        (is (= "boom" (deref result 5000 ::timed-out)))
+        (Thread/sleep 100)
+        ;; with n=2 the third call may start on the failed call's permit
+        ;; before the error is seen; it is then interrupted too
+        (is ((if n #{1 2} #{2}) @interrupted))))
+
+    (testing (str "n=" n " stream mode interrupts in-flight calls")
+      (sut/set-stream-error-handler! (fn [& _]))
+      (try
+        (let [interrupted (atom 0)
+              f           (fn [x]
+                            (if (= x 0)
+                              (do (Thread/sleep 50) (throw (ex-info "boom" {})))
+                              (try (Thread/sleep 30000)
+                                   (catch InterruptedException e (swap! interrupted inc) (throw e)))))
+              src         (a/to-chan (range 3))
+              out         (if n (sut/parallelly n f src) (sut/parallelly f src))]
+          (is (= [] (first (a/alts!! [(a/into [] out) (a/timeout 5000)]))))
+          (Thread/sleep 100)
+          (is ((if n #{1 2} #{2}) @interrupted)))
+        (finally (sut/set-stream-error-handler! println))))))
+
+(deftest interrupt-channel-wait-test
+  (testing "interrupt! stops a fiber parked in <!!"
+    (let [f (sut/fiber (a/<!! (a/chan)))]
+      (Thread/sleep 20)
+      (sut/interrupt! f)
+      (is (await-dead f 2000))))
+  (testing "timeout! stops a fiber parked in >!!"
+    (let [f (sut/timeout! (sut/fiber (a/>!! (a/chan) :x)) 20)]
+      (is (await-dead f 2000)))))
+
+(deftest parallelly-bounded-order-test
+  (testing "bounded seq mode starts items in input order, so an early item can't starve behind later ones"
+    ;; With one permit, item 1 waits on something only item 0 produces. If item
+    ;; 1 could take the permit first, this would deadlock.
+    (dotimes [_ 30]
+      (let [p0     (promise)
+            f      (fn [x] (if (= x 0) (deliver p0 :zero) (deref p0 2000 :starved)))
+            result (future (sut/parallelly 1 f [0 1]))]
+        (is (= [p0 :zero] [p0 (second (deref result 5000 [nil :timed-out]))]))))))

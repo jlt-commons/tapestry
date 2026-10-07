@@ -1,6 +1,7 @@
 (ns tapestry.experimental.scope-test
   (:require [tapestry.experimental.scope :as sut]
             [tapestry.core :as tc]
+            [clojure.core.async :as a]
             [clojure.test :refer [deftest testing is]]))
 
 (deftest with-scope-basic-test
@@ -49,8 +50,8 @@
               (sut/with-scope {:shutdown :on-failure}
                 (reset! slow-ref (tc/fiber (Thread/sleep 30000)))
                 (tc/fiber (throw (ex-info "boom" {}))))))
-        ;; The sibling's result is cancelled on Jolt (body not forcibly stopped).
-        (is (tc/errored? @slow-ref)))
+        (is (tc/errored? @slow-ref))
+        (is (not (tc/alive? @slow-ref)) "scope exit waits for the interrupted sibling"))
       (finally
         (tc/set-stream-error-handler! println))))
 
@@ -234,3 +235,95 @@
         (catch Exception _))
       (is (tc/errored? @slow-ref)
           "fibers should be cancelled when body throws"))))
+
+(deftest scope-captured-at-spawn-test
+  (testing "interrupting a scoped fiber from an unscoped thread still reaches its scope"
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo #"interrupted"
+          (sut/with-scope {:shutdown :on-failure}
+            (let [f (tc/fiber (Thread/sleep 30000))
+                  t (Thread. (fn [] (tc/interrupt! f)))]
+              (.start t)
+              (.join t))))))
+
+  (testing "interrupting an outer fiber from inside a nested scope does not fail the nested scope"
+    (let [inner-result (atom nil)]
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"interrupted"
+            (sut/with-scope {:shutdown :on-failure}
+              (let [outer (tc/fiber (Thread/sleep 30000))]
+                (reset! inner-result
+                        (sut/with-scope {:shutdown :on-failure}
+                          (tc/interrupt! outer)
+                          @(tc/fiber :inner-ok)))))))
+      (is (= :inner-ok @inner-result)))))
+
+(deftest scope-waits-for-bodies-test
+  (testing "scope exit waits for interrupted bodies to finish their cleanup"
+    (let [cleaned (atom false)
+          started (promise)]
+      (sut/with-scope {:shutdown :on-success}
+        (tc/fiber (try (deliver started true)
+                       (Thread/sleep 30000)
+                       (finally (Thread/sleep 50) (reset! cleaned true))))
+        ;; otherwise :fast can win before the slow body starts, and a fiber
+        ;; cancelled before it starts never runs its body
+        @started
+        (tc/fiber :fast))
+      (is (true? @cleaned))))
+
+  (testing "fibers spawned by scoped fibers are awaited too"
+    (let [grandchild-done (atom false)]
+      (sut/with-scope {}
+        (tc/fiber
+          (tc/fiber (Thread/sleep 100) (reset! grandchild-done true))
+          :child))
+      (is (true? @grandchild-done)))))
+
+(deftest asyncly-inside-scope-test
+  (testing "an asyncly error inside an :on-failure scope surfaces as the real error"
+    (tc/set-stream-error-handler! (fn [& _]))
+    (try
+      (doseq [n [nil 2]]
+        (is (thrown-with-msg?
+              clojure.lang.ExceptionInfo #"real-error"
+              (sut/with-scope {:shutdown :on-failure}
+                (let [f (fn [x]
+                          (if (= x 0)
+                            (do (Thread/sleep 20) (throw (ex-info "real-error" {})))
+                            (Thread/sleep 30000)))]
+                  (doall (if n (tc/asyncly n f (range 4)) (tc/asyncly f (range 4)))))))
+            (str "n=" n)))
+      (finally (tc/set-stream-error-handler! println)))))
+
+(deftest body-error-not-masked-by-shutdown-test
+  (testing "the body's own error is rethrown, not the interrupts from shutting down"
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo #"body-error"
+          (sut/with-scope {:shutdown :on-failure}
+            (tc/fiber (Thread/sleep 30000))
+            (Thread/sleep 20)
+            (throw (ex-info "body-error" {})))))))
+
+(deftest scope-exit-with-channel-wait-test
+  (testing "an :on-success scope exits when a sibling is parked on a channel"
+    (let [result (future (sut/with-scope {:shutdown :on-success}
+                           (tc/fiber (a/<!! (a/chan)))
+                           (tc/fiber :fast)
+                           :done))]
+      (is (= :done (deref result 3000 ::hung))))))
+
+(deftest asyncly-queued-workers-inside-scope-test
+  (testing "with fibers queued for permits, the real asyncly error still surfaces"
+    (tc/set-stream-error-handler! (fn [& _]))
+    (try
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"real-error"
+            (sut/with-scope {:shutdown :on-failure}
+              (tc/with-max-parallelism 1
+                (doall (tc/asyncly (fn [x]
+                                     (when (= x 0)
+                                       (Thread/sleep 20)
+                                       (throw (ex-info "real-error" {}))))
+                                   (range 5)))))))
+      (finally (tc/set-stream-error-handler! println)))))

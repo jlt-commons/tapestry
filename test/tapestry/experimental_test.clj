@@ -24,9 +24,8 @@
               (sut/with-scope {:shutdown :on-failure}
                 (reset! slow-ref (tc/fiber (Thread/sleep 30000)))
                 (tc/fiber (throw (ex-info "boom" {}))))))
-        ;; The sibling's result was cancelled even though its body could not be
-        ;; forcibly stopped on Jolt.
-        (is (tc/errored? @slow-ref)))
+        (is (tc/errored? @slow-ref))
+        (is (not (tc/alive? @slow-ref)) "scope exit waits for the interrupted sibling"))
       (finally
         (tc/set-stream-error-handler! println))))
 
@@ -44,8 +43,8 @@
       (sut/with-scope {:shutdown :on-success}
         (reset! slow-ref (tc/fiber (Thread/sleep 30000)))
         (tc/fiber :fast-result))
-      ;; On Jolt the slow body keeps running, but its result is cancelled.
-      (is (tc/errored? @slow-ref))))
+      (is (tc/errored? @slow-ref))
+      (is (not (tc/alive? @slow-ref)))))
 
   (testing "the first successful result is recorded"
     (let [scope-ref (atom nil)]
