@@ -1,6 +1,6 @@
 # Tapestry
 
-[![Build Status](https://github.com/jolt-lang/tapestry/actions/workflows/ci.yml/badge.svg)](https://github.com/jolt-lang/tapestry/actions)
+[![Build Status](https://github.com/jlt-commons/tapestry/actions/workflows/ci.yml/badge.svg)](https://github.com/jlt-commons/tapestry/actions)
 
 Structured concurrency primitives for Clojure running on
 [Jolt](https://github.com/jolt-lang/jolt) (Clojure on Chez Scheme — no JVM).
@@ -30,9 +30,9 @@ manifold/`java.util.concurrent` substrate with `core.async`.
 Requires the [jolt](https://jolt-lang.github.io/) binary, version 0.8.16 or
 later. Add to your deps.edn:
 
-```
-jolt-lang/tapestry {:git/url "https://github.com/jolt-lang/tapestry"
-                    :git/sha "..."}
+```clojure
+io.github.jlt-commons/tapestry {:git/url "https://github.com/jlt-commons/tapestry"
+                                :git/tag "0.6.0" :git/sha "4e11e41"}
 ```
 
 ## Usage
